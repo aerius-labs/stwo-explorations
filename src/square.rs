@@ -38,12 +38,11 @@ impl FrameworkEval for SquareEval {
         eval.add_constraint(square.clone() - n.clone() * n.clone());
 
         // y^2 - n * n === 0
-
         eval
     }
 }
 
-pub fn generate_trace(
+pub fn generate_square_trace(
     log_size: u32,
     inputs: &[PackedBaseField],
 ) -> ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> {
@@ -79,7 +78,8 @@ pub fn prove_square(
     let commitment_scheme =
         &mut CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);
 
-    let trace = generate_trace(log_n_instances, inputs);
+    let trace = generate_square_trace(log_n_instances, inputs);
+
     let mut tree_builder = commitment_scheme.tree_builder();
     tree_builder.extend_evals(trace);
     tree_builder.commit(prover_channel);
@@ -135,8 +135,11 @@ mod tests {
     #[test]
     fn test_square_constraints() {
         const LOG_N_INSTANCES: u32 = 6;
+        // 2^6 = 64 instances
         let inputs = generate_test_inputs(LOG_N_INSTANCES);
-        let trace = generate_trace(LOG_N_INSTANCES, &inputs);
+
+        let trace = generate_square_trace(LOG_N_INSTANCES, &inputs);
+
         let traces = TreeVec::new(vec![trace]);
         let trace_polys =
             traces.map(|trace| trace.into_iter().map(|c| c.interpolate()).collect_vec());
@@ -178,7 +181,7 @@ mod tests {
     fn test_square_fails_with_incorrect_output() {
         const LOG_N_INSTANCES: u32 = 6;
         let inputs = generate_test_inputs(LOG_N_INSTANCES);
-        let mut trace = generate_trace(LOG_N_INSTANCES, &inputs);
+        let mut trace = generate_square_trace(LOG_N_INSTANCES, &inputs);
 
         trace[1].values.set(0, BaseField::one());
 
