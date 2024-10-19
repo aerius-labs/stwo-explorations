@@ -1,20 +1,28 @@
-use itertools::Itertools;
+use num_traits::One;
 use num_traits::Zero;
-
-use stwo_prover::constraint_framework::{
-    EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator,
-};
+use stwo_prover::constraint_framework::TraceLocationAllocator;
 use stwo_prover::core::backend::simd::column::BaseColumn;
-use stwo_prover::core::backend::simd::SimdBackend;
 use stwo_prover::core::backend::Column;
 use stwo_prover::core::channel::Blake2sChannel;
-use stwo_prover::core::fields::m31::M31;
-use stwo_prover::core::pcs::{CommitmentSchemeProver, PcsConfig};
-use stwo_prover::core::poly::circle::{CanonicCoset, CircleEvaluation, PolyOps};
-use stwo_prover::core::poly::BitReversedOrder;
-use stwo_prover::core::prover::{prove, StarkProof};
-use stwo_prover::core::vcs::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
-use stwo_prover::core::ColumnVec;
+use stwo_prover::core::pcs::CommitmentSchemeProver;
+use stwo_prover::core::pcs::PcsConfig;
+use stwo_prover::core::poly::circle::PolyOps;
+use stwo_prover::core::prover::prove;
+use stwo_prover::core::prover::StarkProof;
+use stwo_prover::core::vcs::blake2_merkle::Blake2sMerkleChannel;
+use stwo_prover::core::vcs::blake2_merkle::Blake2sMerkleHasher;
+use stwo_prover::{
+    constraint_framework::{EvalAtRow, FrameworkComponent, FrameworkEval},
+    core::{
+        backend::simd::SimdBackend,
+        fields::m31::M31,
+        poly::{
+            circle::{CanonicCoset, CircleEvaluation},
+            BitReversedOrder,
+        },
+        ColumnVec,
+    },
+};
 
 #[derive(Clone)]
 pub struct MerkleRootEval {
@@ -22,6 +30,12 @@ pub struct MerkleRootEval {
 }
 
 pub type MerkleRootComponent = FrameworkComponent<MerkleRootEval>;
+
+pub struct MerkleProof {
+    pub root: M31,
+    pub stark_proof: StarkProof<Blake2sMerkleHasher>,
+    pub component: FrameworkComponent<MerkleRootEval>,
+}
 
 impl FrameworkEval for MerkleRootEval {
     fn log_size(&self) -> u32 {
@@ -33,69 +47,68 @@ impl FrameworkEval for MerkleRootEval {
     }
 
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
-        let left = eval.next_trace_mask();
-        let right = eval.next_trace_mask();
+        let current = eval.next_trace_mask();
+        let sibling = eval.next_trace_mask();
+        let is_left = eval.next_trace_mask();
         let parent = eval.next_trace_mask();
 
+        // is_leaf col is boolean column
+        eval.add_constraint(is_left.clone() * (is_left.clone() - E::F::one()));
+
         // (todo) : replace with place poseidon/blake hash
-        eval.add_constraint(parent.clone() - (left.clone() + right.clone()));
+        eval.add_constraint(parent.clone() - (current.clone() + sibling.clone()));
+
+        // based on is_left, parent should be either current + sibling or sibling + current
+        let constraint = parent.clone()
+            - (current.clone() + sibling.clone()) * is_left.clone()
+            - (sibling.clone() + current.clone()) * (E::F::one() - is_left.clone());
+
+        eval.add_constraint(constraint);
         eval
     }
 }
 
-const N_COLUMNS: usize = 3;
-
 pub fn gen_merkle_trace(
     log_size: u32,
-    inputs: &[M31],
+    leaf: &M31,
+    proof: &[M31],
+    proof_helper: &[M31],
 ) -> ColumnVec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>> {
     let n_leaves = 1 << log_size;
 
-    let mut trace = (0..N_COLUMNS)
-        .map(|_| vec![M31::zero(); n_leaves])
-        .collect_vec();
+    // Initialize trace columns
+    let mut current = vec![M31::zero(); n_leaves];
+    let mut sibling = vec![M31::zero(); n_leaves];
+    let mut is_left = vec![M31::zero(); n_leaves];
+    let mut parent = vec![M31::zero(); n_leaves];
 
-    let domain = CanonicCoset::new(log_size).circle_domain();
+    current[0] = *leaf;
 
-    // Level 1: Process leaf nodes
-    for i in 0..n_leaves / 2 {
-        trace[0][i] = inputs[2 * i];
-        trace[1][i] = inputs[2 * i + 1];
-        trace[2][i] = trace[0][i] + trace[1][i];
-        println!(
-            "Level 1 - Node {}: left {:?}, right {:?}, parent {:?}",
-            i, trace[0][i].0, trace[1][i].0, trace[2][i].0
-        );
-    }
+    for i in 0..proof.len() {
+        sibling[i] = proof[i];
+        is_left[i] = proof_helper[i];
 
-    // Process higher levels
-    let mut level_size = n_leaves / 2;
-    let mut start_index = n_leaves / 2;
-
-    while level_size > 1 {
-        for i in 0..level_size / 2 {
-            let left = trace[2][start_index - level_size + i * 2];
-            let right = trace[2][start_index - level_size + i * 2 + 1];
-            let parent = left + right;
-
-            trace[0][start_index + i] = left;
-            trace[1][start_index + i] = right;
-            trace[2][start_index + i] = parent;
-
-            println!(
-                "Level {} - Node {}: left {:?}, right {:?}, parent {:?}",
-                (log_size + 1) - (start_index as f32).log2() as u32,
-                start_index + i,
-                left.0,
-                right.0,
-                parent.0
-            );
+        if proof_helper[i] == M31::one() {
+            parent[i] = current[i] + sibling[i]; // Todo(vikas): replace with hash function
+        } else {
+            // Current node is right child
+            parent[i] = sibling[i] + current[i]; // Todo(vikas): replace with hash function
         }
 
-        start_index += level_size / 2;
-        level_size /= 2;
+        // Set up for next level
+        if i < proof.len() - 1 {
+            current[i + 1] = parent[i];
+        }
     }
 
+    let trace = vec![
+        current.clone(),
+        sibling.clone(),
+        is_left.clone(),
+        parent.clone(),
+    ];
+
+    let domain = CanonicCoset::new(log_size).circle_domain();
     trace
         .into_iter()
         .map(|col| {
@@ -104,19 +117,19 @@ pub fn gen_merkle_trace(
                 BaseColumn::from_iter(col),
             )
         })
-        .collect_vec()
+        .collect()
 }
 
-pub struct MerkleProof {
-    pub root: M31,
-    pub stark_proof: StarkProof<Blake2sMerkleHasher>,
-    pub component: FrameworkComponent<MerkleRootEval>,
-}
-
-pub fn prove_merkle_tree(log_n_leaves: u32, inputs: &[M31], config: PcsConfig) -> MerkleProof {
+pub fn prove_merkle_tree(
+    log_n_leaves: u32,
+    leaf: &M31,
+    proof: &[M31],
+    proof_helper: &[M31],
+    config: PcsConfig,
+) -> MerkleProof {
     let mut channel = Blake2sChannel::default();
 
-    let trace = gen_merkle_trace(log_n_leaves, inputs);
+    let trace = gen_merkle_trace(log_n_leaves, leaf, proof, proof_helper);
 
     let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(log_n_leaves + config.fri_config.log_blowup_factor + 1)
@@ -137,7 +150,8 @@ pub fn prove_merkle_tree(log_n_leaves: u32, inputs: &[M31], config: PcsConfig) -
 
     let stark_proof = prove(&[&component], &mut channel, &mut commitment_scheme).unwrap();
 
-    let root = trace.last().unwrap().at((1 << log_n_leaves) - 2);
+    let root_col = proof.len() - 1;
+    let root = trace.last().unwrap().at(root_col);
 
     MerkleProof {
         root,
@@ -148,41 +162,46 @@ pub fn prove_merkle_tree(log_n_leaves: u32, inputs: &[M31], config: PcsConfig) -
 
 #[cfg(test)]
 mod tests {
+
+    use stwo_prover::core::{air::Component, pcs::CommitmentSchemeVerifier, prover::verify};
+
     use super::*;
-    use stwo_prover::core::{
-        air::Component,
-        fields::m31::BaseField,
-        pcs::{CommitmentSchemeVerifier, PcsConfig},
-        prover::verify,
-    };
 
     #[test]
     fn test_merkle_tree_circuit() {
-        // 2^3 = 8 leaves
+        // Example Test Case Merkle Tree
+        //
+        //               ROOT (130)
+        //             /          \
+        //        (59)            (71)
+        //        /    \         /    \
+        //    (27)    (32)     (35)   (36)
+        //    /  \    /  \     /  \    /  \
+        //  (12)(15)(16)(16) (17)(18)(19)(17)
 
-        // level 1
-        // left 1, right 2, parent 3
-        // left 3, right 4, parent 7
-        // left 5, right 6, parent 11
-        // left 7, right 8, parent 15
+        // Merkle proof for leaf 16:
+        // Proof values: [16, 27, 71]
+        // Proof helper: [0, 1, 0]  (0 for right sibling, 1 for left sibling)
 
-        // level 2
-        // left 3, right 7, parent 10
-        // left 11, right 15, parent 26
+        let leaf = M31::from_u32_unchecked(16);
+        let proof = vec![
+            M31::from_u32_unchecked(16), // Sibling at level 0
+            M31::from_u32_unchecked(27), // Sibling at level 1
+            M31::from_u32_unchecked(71), // Sibling at level 2
+        ];
+        let proof_helper = vec![
+            M31::zero(), // Right sibling at level 0
+            M31::one(),  // Left sibling at level 1
+            M31::zero(), // Right sibling at level 2
+        ];
 
-        // level 3
-        // left 10, right 26, parent 36
-
-        const LOG_N_LEAVES: u32 = 3;
         let config = PcsConfig::default();
-
-        let leaves: Vec<BaseField> = (1..=8).map(|i| M31::from_u32_unchecked(i)).collect();
-
-        let merkle_proof = prove_merkle_tree(LOG_N_LEAVES, &leaves, config);
-        let root = merkle_proof.root;
-        assert!(root.0 == 36);
-
+        let merkle_proof = prove_merkle_tree(2, &leaf, &proof, &proof_helper, config);
         let proof = merkle_proof.stark_proof;
+
+        let root = merkle_proof.root;
+        assert!(root.0 == 130);
+
         let component = merkle_proof.component;
         let sizes = component.trace_log_degree_bounds();
 
