@@ -1,31 +1,37 @@
 use num_traits::{One, Zero};
-use stwo_prover::constraint_framework::TraceLocationAllocator;
-use stwo_prover::constraint_framework::{EvalAtRow, FrameworkComponent, FrameworkEval};
+use prettytable::{row, Table};
+use stwo_prover::constraint_framework::{
+    EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator,
+};
 use stwo_prover::core::backend::simd::column::BaseColumn;
 use stwo_prover::core::backend::simd::SimdBackend;
 use stwo_prover::core::channel::Blake2sChannel;
-use stwo_prover::core::fields::m31::BaseField;
-use stwo_prover::core::fields::m31::M31;
-use stwo_prover::core::pcs::CommitmentSchemeProver;
-use stwo_prover::core::pcs::PcsConfig;
-use stwo_prover::core::poly::circle::CanonicCoset;
-use stwo_prover::core::poly::circle::CircleEvaluation;
-use stwo_prover::core::poly::circle::PolyOps;
+use stwo_prover::core::fields::m31::{BaseField, M31};
+use stwo_prover::core::pcs::{CommitmentSchemeProver, PcsConfig};
+use stwo_prover::core::poly::circle::{CanonicCoset, CircleEvaluation, PolyOps};
 use stwo_prover::core::poly::BitReversedOrder;
-use stwo_prover::core::prover::prove;
-use stwo_prover::core::prover::StarkProof;
-use stwo_prover::core::vcs::blake2_merkle::Blake2sMerkleChannel;
-use stwo_prover::core::vcs::blake2_merkle::Blake2sMerkleHasher;
+use stwo_prover::core::prover::{prove, StarkProof};
+use stwo_prover::core::vcs::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
 use stwo_prover::core::ColumnVec;
 
-pub fn store_u64(value: u64) -> (u32, u32) {
-    let lower = value as u32;
-    let upper = (value >> 32) as u32;
-    (lower, upper)
+pub fn store_u16(value: u64) -> (u16, u16, u16, u16) {
+    let lower = value as u16;
+    let upper = (value >> 16) as u16;
+    let upper_upper = (value >> 32) as u16;
+    let upper_upper_upper = (value >> 48) as u16;
+    (lower, upper, upper_upper, upper_upper_upper)
 }
 
-pub fn reconstruct_u64(lower: u32, upper: u32) -> u64 {
-    ((upper as u64) << 32) | (lower as u64)
+pub fn reconstruct_u64_from_u16(
+    lower: u16,
+    upper: u16,
+    upper_upper: u16,
+    upper_upper_upper: u16,
+) -> u64 {
+    ((upper_upper_upper as u64) << 48)
+        | ((upper_upper as u64) << 32)
+        | ((upper as u64) << 16)
+        | (lower as u64)
 }
 
 pub struct LimbsProof {
@@ -48,39 +54,36 @@ impl FrameworkEval for LimbsEval {
     fn max_constraint_log_degree_bound(&self) -> u32 {
         self.log_n_rows + 1
     }
-
-    // input => (limb0, limb1)
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
-        let limb0 = eval.next_trace_mask(); // low 32 bit
-        let limb1 = eval.next_trace_mask(); // high 32 bit
-        let low_limb0 = eval.next_trace_mask(); // Lower 32 bits of low bound
-        let low_limb1 = eval.next_trace_mask(); // Upper 32 bits of low bound
-        let is_greater = eval.next_trace_mask(); // Boolean flag for result
+        let limb0 = eval.next_trace_mask();
+        let limb1 = eval.next_trace_mask();
+        let limb2 = eval.next_trace_mask();
+        let limb3 = eval.next_trace_mask();
 
-        // First compare high limbs
-        let high_diff = eval.next_trace_mask();
-        eval.add_constraint(high_diff.clone() - (limb1.clone() - low_limb1.clone()));
+        let low_limb0 = eval.next_trace_mask();
+        let low_limb1 = eval.next_trace_mask();
+        let low_limb2 = eval.next_trace_mask();
+        let low_limb3 = eval.next_trace_mask();
 
-        // Then compare low limbs if high limbs are equal
-        let low_diff = eval.next_trace_mask();
-        eval.add_constraint(low_diff.clone() - (limb0.clone() - low_limb0.clone()));
+        let result = eval.next_trace_mask();
 
-        // Ensure is_greater is boolean
-        eval.add_constraint(is_greater.clone() * (E::F::one() - is_greater.clone()));
+        let diff0 = eval.next_trace_mask(); // limb0 - low_limb0
+        let diff1 = eval.next_trace_mask(); // limb1 - low_limb1
+        let diff2 = eval.next_trace_mask(); // limb2 - low_limb2
+        let diff3 = eval.next_trace_mask(); // limb3 - low_limb3
 
-        // If high_diff > 0, is_greater must be 1
-        eval.add_constraint(high_diff.clone() * (is_greater.clone() - E::F::one()));
+        // need boolean constraints for diff0, diff1, diff2, diff3
+        eval.add_constraint(diff0.clone() * (diff0.clone() - E::F::one()));
+        eval.add_constraint(diff1.clone() * (diff1.clone() - E::F::one()));
+        eval.add_constraint(diff2.clone() * (diff2.clone() - E::F::one()));
+        eval.add_constraint(diff3.clone() * (diff3.clone() - E::F::one()));
 
-        // If high_diff < 0, is_greater must be 0
-        eval.add_constraint((-high_diff.clone()) * is_greater.clone());
+        // 1. Constrain result to be boolean (0 or 1)
+        eval.add_constraint(result.clone() * (result.clone() - E::F::one()));
 
-        // todo: need to fix these
-        // If high_diff = 0, then low_diff determines is_greater
-        // eval.add_constraint(
-        //     (E::F::one() - high_diff.clone())
-        //         * (low_diff.clone() * (is_greater.clone() - E::F::one())
-        //             + (-low_diff.clone()) * is_greater.clone()),
-        // );
+        // i need write a single long constraint which compares because it contains if else statements
+        // first i want to check whether if diff3 positive should result be 1 else 0
+        // eval.add_constraint(result.clone() - diff0.clone());
 
         eval
     }
@@ -92,36 +95,102 @@ pub fn generate_trace(
     low_bound: u64,
 ) -> ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> {
     let mut trace = vec![
-        vec![M31::zero(); 1 << log_size], // limb0
-        vec![M31::zero(); 1 << log_size], // limb1
-        vec![M31::zero(); 1 << log_size], // low_limb0
-        vec![M31::zero(); 1 << log_size], // low_limb1
-        vec![M31::zero(); 1 << log_size], // is_greater
-        vec![M31::zero(); 1 << log_size], // high_diff
-        vec![M31::zero(); 1 << log_size], // low_diff
+        vec![M31::zero(); 1 << log_size],
+        vec![M31::zero(); 1 << log_size],
+        vec![M31::zero(); 1 << log_size],
+        vec![M31::zero(); 1 << log_size],
+        vec![M31::zero(); 1 << log_size],
+        vec![M31::zero(); 1 << log_size],
+        vec![M31::zero(); 1 << log_size],
+        vec![M31::zero(); 1 << log_size],
+        vec![M31::zero(); 1 << log_size],
+        vec![M31::zero(); 1 << log_size],
+        vec![M31::zero(); 1 << log_size],
+        vec![M31::zero(); 1 << log_size],
+        vec![M31::zero(); 1 << log_size],
     ];
 
     for (i, &input) in inputs.iter().enumerate() {
-        let (input_low, input_high) = store_u64(input);
-        let (low_low, low_high) = store_u64(low_bound);
+        let (limb0, limb1, limb2, limb3) = store_u16(input);
+        let (low_limb0, low_limb1, low_limb2, low_limb3) = store_u16(low_bound);
 
-        trace[0][i] = M31::from_u32_unchecked(input_low);
-        trace[1][i] = M31::from_u32_unchecked(input_high);
-        trace[2][i] = M31::from_u32_unchecked(low_low);
-        trace[3][i] = M31::from_u32_unchecked(low_high);
+        trace[0][i] = M31::from_u32_unchecked(limb0 as u32); // limb0
+        trace[1][i] = M31::from_u32_unchecked(limb1 as u32); // limb1
+        trace[2][i] = M31::from_u32_unchecked(limb2 as u32); // limb2
+        trace[3][i] = M31::from_u32_unchecked(limb3 as u32); // limb3
 
-        let high_diff = input_high as i64 - low_high as i64;
-        trace[5][i] = M31::from_u32_unchecked(high_diff as u32);
+        trace[4][i] = M31::from_u32_unchecked(low_limb0 as u32); // low_limb0
+        trace[5][i] = M31::from_u32_unchecked(low_limb1 as u32); // low_limb1
+        trace[6][i] = M31::from_u32_unchecked(low_limb2 as u32); // low_limb2
+        trace[7][i] = M31::from_u32_unchecked(low_limb3 as u32); // low_limb3
 
-        let low_diff = input_low as i64 - low_low as i64;
-        trace[6][i] = M31::from_u32_unchecked(low_diff as u32);
+        trace[8][i] = if input > low_bound {
+            M31::one()
+        } else {
+            M31::zero()
+        };
 
-        trace[4][i] = if input > low_bound {
+        trace[9][i] = if (limb0 as i32 - low_limb0 as i32) > 0 {
+            M31::one()
+        } else {
+            M31::zero()
+        };
+
+        trace[10][i] = if (limb1 as i32 - low_limb1 as i32) > 0 {
+            M31::one()
+        } else {
+            M31::zero()
+        };
+
+        trace[11][i] = if (limb2 as i32 - low_limb2 as i32) > 0 {
+            M31::one()
+        } else {
+            M31::zero()
+        };
+
+        trace[12][i] = if (limb3 as i32 - low_limb3 as i32) > 0 {
             M31::one()
         } else {
             M31::zero()
         };
     }
+    // just for debugging. need to remove later!
+    let mut table = Table::new();
+    table.add_row(row![
+        "limb0",
+        "limb1",
+        "limb2",
+        "limb3",
+        "low_limb0",
+        "low_limb1",
+        "low_limb2",
+        "low_limb3",
+        "result",
+        "diff0",
+        "diff1",
+        "diff2",
+        "diff3"
+    ]);
+
+    for i in 0..1 {
+        table.add_row(row![
+            trace[0][i],
+            trace[1][i],
+            trace[2][i],
+            trace[3][i],
+            trace[4][i],
+            trace[5][i],
+            trace[6][i],
+            trace[7][i],
+            trace[8][i],
+            trace[9][i],
+            trace[10][i],
+            trace[11][i],
+            trace[12][i]
+        ]);
+    }
+
+    table.printstd();
 
     let domain = CanonicCoset::new(log_size).circle_domain();
     trace
@@ -178,10 +247,11 @@ mod tests {
     use super::*;
     #[test]
     fn test_limbs_circuit() {
-        let input = 9183912831293123u64;
-        let low_bound = 9183912831293122u64;
+        // let input1 = 9312783901273712u64; // u64
+        let input2 = 0x1234_5678_9ABC_DEF1;
+        let low_bound = 0x1234_5678_9ABC_DEF0u64;
 
-        let input_arr = [input];
+        let input_arr = [input2];
         let config = PcsConfig::default();
         let limbs_proof = prove_limbs(3, &input_arr, low_bound, config);
 
