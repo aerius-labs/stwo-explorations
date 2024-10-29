@@ -66,24 +66,27 @@ impl FrameworkEval for LimbsEval {
         let low_limb3 = eval.next_trace_mask();
 
         let result = eval.next_trace_mask();
+        let gt0 = eval.next_trace_mask();
+        let gt1 = eval.next_trace_mask();
+        let gt2 = eval.next_trace_mask();
+        let gt3 = eval.next_trace_mask();
 
-        let diff0 = eval.next_trace_mask(); // limb0 - low_limb0
-        let diff1 = eval.next_trace_mask(); // limb1 - low_limb1
-        let diff2 = eval.next_trace_mask(); // limb2 - low_limb2
-        let diff3 = eval.next_trace_mask(); // limb3 - low_limb3
-
-        // need boolean constraints for diff0, diff1, diff2, diff3
-        eval.add_constraint(diff0.clone() * (diff0.clone() - E::F::one()));
-        eval.add_constraint(diff1.clone() * (diff1.clone() - E::F::one()));
-        eval.add_constraint(diff2.clone() * (diff2.clone() - E::F::one()));
-        eval.add_constraint(diff3.clone() * (diff3.clone() - E::F::one()));
-
-        // 1. Constrain result to be boolean (0 or 1)
         eval.add_constraint(result.clone() * (result.clone() - E::F::one()));
 
-        // i need write a single long constraint which compares because it contains if else statements
-        // first i want to check whether if diff3 positive should result be 1 else 0
-        // eval.add_constraint(result.clone() - diff0.clone());
+        eval.add_constraint(gt0.clone() * (gt0.clone() - E::F::one()));
+        eval.add_constraint(gt1.clone() * (gt1.clone() - E::F::one()));
+        eval.add_constraint(gt2.clone() * (gt2.clone() - E::F::one()));
+        eval.add_constraint(gt3.clone() * (gt3.clone() - E::F::one()));
+
+        let should_be_result = gt3.clone()
+            + (E::F::one() - gt3.clone()) * gt2.clone()
+            + (E::F::one() - gt3.clone()) * (E::F::one() - gt2.clone()) * gt1.clone()
+            + (E::F::one() - gt3.clone())
+                * (E::F::one() - gt2.clone())
+                * (E::F::one() - gt1.clone())
+                * gt0.clone();
+
+        eval.add_constraint(result - should_be_result);
 
         eval
     }
@@ -166,13 +169,13 @@ pub fn generate_trace(
         "low_limb2",
         "low_limb3",
         "result",
-        "diff0",
-        "diff1",
-        "diff2",
-        "diff3"
+        "gt0",
+        "gt1",
+        "gt2",
+        "gt3"
     ]);
 
-    for i in 0..1 {
+    for i in 0..2 {
         table.add_row(row![
             trace[0][i],
             trace[1][i],
@@ -247,11 +250,11 @@ mod tests {
     use super::*;
     #[test]
     fn test_limbs_circuit() {
-        // let input1 = 9312783901273712u64; // u64
-        let input2 = 0x1234_5678_9ABC_DEF1;
-        let low_bound = 0x1234_5678_9ABC_DEF0u64;
+        let input1 = 0x1234_5678_9ABC_DEF2u64; // u64
+        let input2 = 0x1234_5678_9ABC_DEF0;
+        let low_bound = 0x1234_5678_9ABC_DEF1u64;
 
-        let input_arr = [input2];
+        let input_arr = [input2, input1];
         let config = PcsConfig::default();
         let limbs_proof = prove_limbs(3, &input_arr, low_bound, config);
 
